@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS vault (
     created_by TEXT,
     updated_at INTEGER,
     updated_by TEXT,
-    sort_order INTEGER DEFAULT 0
+    sort_order INTEGER DEFAULT 0,
+    deleted_at INTEGER
 );
 
 -- 云端备份源配置表

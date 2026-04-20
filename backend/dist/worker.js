@@ -20648,7 +20648,8 @@ var vault = sqliteTable("vault", {
   // 'username' or 'restore'
   updatedAt: integer2("updated_at"),
   updatedBy: text2("updated_by"),
-  sortOrder: integer2("sort_order").default(0)
+  sortOrder: integer2("sort_order").default(0),
+  deletedAt: integer2("deleted_at")
 });
 var backupProviders = sqliteTable("backup_providers", {
   id: integer2("id").primaryKey({ autoIncrement: true }),
@@ -21989,7 +21990,8 @@ var vault2 = mysqlTable("vault", {
   createdBy: varchar2("created_by", { length: 255 }),
   updatedAt: bigint2("updated_at", { mode: "number" }),
   updatedBy: varchar2("updated_by", { length: 255 }),
-  sortOrder: bigint2("sort_order", { mode: "number" }).default(0)
+  sortOrder: bigint2("sort_order", { mode: "number" }).default(0),
+  deletedAt: bigint2("deleted_at", { mode: "number" })
 });
 var backupProviders2 = mysqlTable("backup_providers", {
   id: int("id").primaryKey().autoincrement(),
@@ -22067,7 +22069,8 @@ var vault3 = pgTable("vault", {
   createdBy: varchar("created_by"),
   updatedAt: bigint("updated_at", { mode: "number" }),
   updatedBy: varchar("updated_by"),
-  sortOrder: bigint("sort_order", { mode: "number" }).default(0)
+  sortOrder: bigint("sort_order", { mode: "number" }).default(0),
+  deletedAt: bigint("deleted_at", { mode: "number" })
 });
 var backupProviders3 = pgTable("backup_providers", {
   id: serial("id").primaryKey(),
@@ -46308,6 +46311,7 @@ var VaultService = class {
     const items = await this.repository.findPaginated(page, limit, search, category);
     const totalCount = await this.repository.count(search, category);
     const categoryStats = await this.repository.getCategoryStats();
+    const trashCount = await this.repository.countDeleted();
     const decryptedItems = await Promise.all(items.map(async (item) => ({
       ...item,
       secret: await decryptField(item.secret, this.encryptionKey) || ""
@@ -46315,6 +46319,7 @@ var VaultService = class {
     return {
       items: decryptedItems,
       totalCount,
+      trashCount,
       totalPages: Math.ceil(totalCount / limit) || 1,
       categoryStats: categoryStats.map((s2) => ({
         category: s2.category || "",
@@ -46695,6 +46700,96 @@ var VaultService = class {
   }
 };
 
+// src/features/vault/trashService.ts
+var TrashService = class {
+  repository;
+  env;
+  encryptionKey;
+  constructor(env, repository) {
+    this.env = env;
+    this.repository = repository;
+    this.encryptionKey = env?.ENCRYPTION_KEY || "";
+  }
+  /**
+   * TRASH: 1.1 精准软瘫痪 - 将账号移入回收站
+   */
+  async moveToTrash(id) {
+    const existing = await this.repository.findById(id);
+    if (!existing) throw new AppError("Item not found", 404);
+    if (existing.deletedAt !== null) {
+      return { success: true };
+    }
+    await this.repository.update(id, { deletedAt: Date.now() });
+    return { success: true };
+  }
+  /**
+   * TRASH: 1.4 回收站独立拉取
+   */
+  async getTrashList() {
+    const items = await this.repository.findDeleted();
+    return Promise.all(items.map(async (item) => ({
+      ...item,
+      secret: this.encryptionKey ? await decryptField(item.secret, this.encryptionKey) || "" : ""
+    })));
+  }
+  /**
+   * TRASH: 1.6 & 1.7 强制沉淀置顶恢复 (Restore Strategy B)
+   */
+  async restoreItem(id) {
+    const existing = await this.repository.findById(id);
+    if (!existing) throw new AppError("Item not found", 404);
+    if (existing.deletedAt === null) {
+      return { success: true };
+    }
+    const maxSortOrder = await this.repository.getMaxSortOrder();
+    const SAFE_MAX = Number.MAX_SAFE_INTEGER - 2e3;
+    let nextSortOrder = maxSortOrder + 1e3;
+    if (nextSortOrder > SAFE_MAX) {
+      nextSortOrder = SAFE_MAX;
+    }
+    await this.repository.update(id, {
+      deletedAt: null,
+      sortOrder: nextSortOrder
+    });
+    return { success: true };
+  }
+  /**
+   * TRASH: 1.9 批量软删除
+   */
+  async batchMoveToTrash(ids) {
+    if (!ids || ids.length === 0) return { count: 0 };
+    const count = await this.repository.batchSoftDelete(ids, Date.now());
+    return { success: true, count };
+  }
+  /**
+   * TRASH: 1.10 越权防御与物理硬删除
+   */
+  async hardDelete(id) {
+    const res = await this.repository.delete(id);
+    if (!res) throw new AppError("Item not found", 404);
+    return { success: true };
+  }
+  /**
+   * TRASH: 1.11 一键清空回收站
+   */
+  async emptyTrash() {
+    const deletedCount = await this.repository.emptyTrashPhysical();
+    return { success: true, deletedCount };
+  }
+  /**
+   * TRASH: 2.6 时钟窜改防卫
+   */
+  async validateAndDelete(id, clientTimestamp) {
+    const now = Date.now();
+    let deletedAt = clientTimestamp;
+    if (clientTimestamp < 0 || clientTimestamp > now + 3e5) {
+      deletedAt = now;
+    }
+    await this.repository.update(id, { deletedAt });
+    return { success: true };
+  }
+};
+
 // src/shared/db/repositories/vaultRepository.ts
 var VaultRepository = class {
   db;
@@ -46705,13 +46800,13 @@ var VaultRepository = class {
    * 获取所有的 vault items (2FA accounts)
    */
   async findAll() {
-    return await this.db.select().from(vault4).orderBy(desc(vault4.sortOrder), desc(vault4.createdAt));
+    return await this.db.select().from(vault4).where(isNull(vault4.deletedAt)).orderBy(desc(vault4.sortOrder), desc(vault4.createdAt));
   }
   /**
    * 获取当前最大排序值
    */
   async getMaxSortOrder() {
-    const result = await this.db.select({ maxSort: sql`max(${vault4.sortOrder})` }).from(vault4);
+    const result = await this.db.select({ maxSort: sql`max(${vault4.sortOrder})` }).from(vault4).where(isNull(vault4.deletedAt));
     return result[0]?.maxSort || 0;
   }
   /**
@@ -46734,6 +46829,7 @@ var VaultRepository = class {
         conditions.push(eq(vault4.category, category));
       }
     }
+    conditions.push(isNull(vault4.deletedAt));
     if (conditions.length > 0) {
       query = query.where(and(...conditions));
     }
@@ -46746,7 +46842,7 @@ var VaultRepository = class {
     return await this.db.select({
       category: vault4.category,
       count: sql`count(*)`
-    }).from(vault4).groupBy(vault4.category);
+    }).from(vault4).where(isNull(vault4.deletedAt)).groupBy(vault4.category);
   }
   /**
    * 批量更新排序 (高性能版 - CASE WHEN 批量 SQL)
@@ -46800,6 +46896,7 @@ var VaultRepository = class {
         conditions.push(eq(vault4.category, category));
       }
     }
+    conditions.push(isNull(vault4.deletedAt));
     if (conditions.length > 0) {
       query = query.where(and(...conditions));
     }
@@ -46822,7 +46919,8 @@ var VaultRepository = class {
     const result = await this.db.select().from(vault4).where(
       and(
         sql`lower(${vault4.service}) = ${normalizedService}`,
-        sql`lower(${vault4.account}) = ${normalizedAccount}`
+        sql`lower(${vault4.account}) = ${normalizedAccount}`,
+        isNull(vault4.deletedAt)
       )
     ).limit(1);
     return result[0];
@@ -46884,6 +46982,40 @@ var VaultRepository = class {
     }
     return deletedCount;
   }
+  /**
+   * TRASH: 获取所有软删除账号
+   */
+  async findDeleted() {
+    return await this.db.select().from(vault4).where(sql`${vault4.deletedAt} IS NOT NULL`).orderBy(desc(vault4.deletedAt));
+  }
+  /**
+   * TRASH: 批量软删除
+   */
+  async batchSoftDelete(ids, timestamp3) {
+    if (!ids || ids.length === 0) return 0;
+    let count = 0;
+    const BATCH = 50;
+    for (let i2 = 0; i2 < ids.length; i2 += BATCH) {
+      const chunk = ids.slice(i2, i2 + BATCH);
+      await this.db.update(vault4).set({ deletedAt: timestamp3, sortOrder: 0 }).where(inArray(vault4.id, chunk));
+      count += chunk.length;
+    }
+    return count;
+  }
+  /**
+   * TRASH: 清空回收站
+   */
+  async emptyTrashPhysical() {
+    await this.db.delete(vault4).where(sql`${vault4.deletedAt} IS NOT NULL`);
+    return 1;
+  }
+  /**
+   * TRASH: 统计软删除的数量
+   */
+  async countDeleted() {
+    const result = await this.db.select({ count: sql`count(*)` }).from(vault4).where(sql`${vault4.deletedAt} IS NOT NULL`);
+    return result[0]?.count || 0;
+  }
 };
 
 // src/features/vault/vaultRoutes.ts
@@ -46892,6 +47024,10 @@ var getService2 = (c2) => {
   const repo = new VaultRepository(c2.env.DB);
   return new VaultService(c2.env, repo);
 };
+var getTrashService = (c2) => {
+  const repo = new VaultRepository(c2.env.DB);
+  return new TrashService(c2.env, repo);
+};
 vault5.use("/*", authMiddleware);
 vault5.get("/", async (c2) => {
   const page = parseInt(c2.req.query("page") || "1", 10);
@@ -46899,11 +47035,14 @@ vault5.get("/", async (c2) => {
   const search = c2.req.query("search") || "";
   const category = c2.req.query("category") || "";
   const service = getService2(c2);
+  const repo = new VaultRepository(c2.env.DB);
   const result = await service.getAccountsPaginated(page, limit, search, category);
+  const trashCount = await repo.countDeleted();
   return c2.json({
     success: true,
     vault: result.items,
     categoryStats: result.categoryStats,
+    trashCount,
     pagination: {
       page,
       limit,
@@ -46930,6 +47069,40 @@ vault5.patch("/:id/sort-order", async (c2) => {
   const service = getService2(c2);
   await service.moveSingleItem(id, sortOrder);
   return c2.json({ success: true });
+});
+vault5.get("/trash", async (c2) => {
+  const trashService = getTrashService(c2);
+  const vault6 = await trashService.getTrashList();
+  return c2.json({ success: true, vault: vault6 });
+});
+vault5.post("/:id/trash_move", async (c2) => {
+  const id = c2.req.param("id");
+  const trashService = getTrashService(c2);
+  const result = await trashService.moveToTrash(id);
+  return c2.json(result);
+});
+vault5.post("/:id/trash_restore", async (c2) => {
+  const id = c2.req.param("id");
+  const trashService = getTrashService(c2);
+  const result = await trashService.restoreItem(id);
+  return c2.json(result);
+});
+vault5.post("/trash_batch_move", async (c2) => {
+  const { ids } = await c2.req.json();
+  const trashService = getTrashService(c2);
+  const result = await trashService.batchMoveToTrash(ids || []);
+  return c2.json(result);
+});
+vault5.delete("/:id/trash_hard", async (c2) => {
+  const id = c2.req.param("id");
+  const trashService = getTrashService(c2);
+  const result = await trashService.hardDelete(id);
+  return c2.json(result);
+});
+vault5.delete("/trash_empty", async (c2) => {
+  const trashService = getTrashService(c2);
+  const result = await trashService.emptyTrash();
+  return c2.json(result);
 });
 vault5.post("/", async (c2) => {
   const user = c2.get("user");
@@ -57716,6 +57889,13 @@ var MIGRATIONS = [
             ALTER TABLE rate_limits ALTER COLUMN expires_at TYPE BIGINT;
             ALTER TABLE rate_limits ALTER COLUMN attempts TYPE BIGINT;
         `
+  },
+  {
+    version: 10,
+    name: "add_deleted_at_to_vault",
+    sqlite: `ALTER TABLE vault ADD COLUMN deleted_at INTEGER; CREATE INDEX IF NOT EXISTS idx_vault_deleted_at ON vault(deleted_at);`,
+    mysql: `ALTER TABLE vault ADD COLUMN deleted_at BIGINT; CREATE INDEX idx_vault_deleted_at ON vault(deleted_at);`,
+    postgres: `ALTER TABLE vault ADD COLUMN deleted_at BIGINT; CREATE INDEX IF NOT EXISTS idx_vault_deleted_at ON vault(deleted_at);`
   }
 ];
 async function migrateDatabase(db) {
