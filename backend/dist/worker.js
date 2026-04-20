@@ -46254,7 +46254,7 @@ function parseOTPAuthURI(uri) {
     const label = decodeURIComponent(url.pathname.substring(1));
     const [issuer, account] = label.includes(":") ? label.split(":", 2) : ["", label];
     const issuerName = sanitizeInput(params.get("issuer") || issuer, 50);
-    const isSteam = type === "steam" || params.get("algorithm")?.toUpperCase() === "STEAM" || params.get("tokenType")?.toUpperCase() === "STEAM";
+    const isSteam = type === "steam" || params.get("algorithm")?.toUpperCase() === "STEAM" || params.get("tokenType")?.toUpperCase() === "STEAM" || params.get("issuer")?.toUpperCase() === "STEAM" && params.get("digits") === "5";
     let algorithm = (params.get("algorithm") || "SHA1").toUpperCase().replace("SHA1", "SHA-1").replace("SHA256", "SHA-256").replace("SHA512", "SHA-512");
     if (!["SHA-1", "SHA-256", "SHA-512", "STEAM"].includes(algorithm)) {
       algorithm = "SHA-1";
@@ -46281,7 +46281,7 @@ function buildOTPAuthURI(data) {
   const label = encodeURIComponent(`${service}:${account}`);
   const issuer = encodeURIComponent(service);
   if (algorithm === "STEAM") {
-    return `otpauth://steam/${label}?secret=${secret}&issuer=${issuer}&algorithm=STEAM&digits=5`;
+    return `otpauth://steam/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=5`;
   }
   const algoParam = algorithm.replace("-", "");
   return `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=${algoParam}&digits=${digits}&period=${period}`;

@@ -55,7 +55,7 @@
 
 ## 🛡 深度安全审计 (Security Auditing)
 
-[**点击查看由 GitHub Actions 自动生成的安全审计报告**](https://github.com/nodeauth/nodeauth-worker/blob/security-audit/README.md)
+[**点击查看由 GitHub Actions 自动生成的安全审计报告**](https://github.com/nodeauth/nodeauth-worker/blob/security/README.md)
 
 ---
 
