@@ -47448,16 +47448,15 @@ var VaultRepository = class {
    * 批量更新排序 (高性能版 - CASE WHEN 批量 SQL)
    *
    * 旧实现：N 次串行 UPDATE，每次一个 DB 往返 → 8474 条记录需要 30+ 秒
-   * 新实现：每批 300 条合并为 1 条 CASE WHEN SQL → 8474 条只需 ~29 次 DB 往返
-   *
-   * 分批原因：SQLite 默认参数上限为 999 个
-   *   每条记录占用 3 个参数 (WHEN id / THEN sortOrder / WHERE IN id)
-   *   安全分批大小 = floor(999 / 3) = 333，使用 300 留有余量
-   *   MySQL / PostgreSQL 参数上限为 65535，300 同样完全安全
+   * 新实现：每批 30 条合并为 1 条 CASE WHEN SQL → 减少频繁网络开销，同时规避上限 
+   * 
+   * 分批原因：虽然 SQLite 默认参数上限为 999 个，但 **Cloudflare D1 硬性限制每条执行语句最多只能有 100 个绑定参数**！
+   *   每条记录在此 CASE WHEN 结构中占用 3 个参数 (WHEN id / THEN sortOrder / WHERE IN id)
+   *   33 乘以 3 = 99，所以安全分批大小最大为 33，此处使用 30 留有余量。
    */
   async updateSortOrders(updates) {
     if (!updates || updates.length === 0) return;
-    const CHUNK_SIZE = 300;
+    const CHUNK_SIZE = 30;
     for (let i2 = 0; i2 < updates.length; i2 += CHUNK_SIZE) {
       const chunk = updates.slice(i2, i2 + CHUNK_SIZE);
       if (chunk.length === 1) {
